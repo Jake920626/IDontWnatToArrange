@@ -5,6 +5,8 @@ import queue
 import time
 import getpass
 import schedule
+import pytz
+from datetime import datetime
 
 # import mqtt modules
 import paho.mqtt.client as mqtt
@@ -21,15 +23,14 @@ Setting basic information
 """
 
 # Database info
-DB_HOST = "194.12.158.118"
+DB_HOST = "172.19.16.1"
 DB_PORT = "5432"
-DB_USER = "postgres"
-DB_NAME = "plc_data"
-# DB_PASSWORD = getpass.getpass("Enter the password for the database: ")
-DB_PASSWORD = "12345678"
+DB_USER = "TIDC_B205"
+DB_NAME = "PLC_COLLECT"
+DB_PASSWORD = getpass.getpass("Enter the password for the database: ")
 
 # MQTT connection info
-MQTT_BROKER = "194.12.158.118"
+MQTT_BROKER = "172.19.16.1"
 MQTT_PORT = 1883
 MQTT_TOPIC = "plc/s7-1200/temperature"
 
@@ -52,9 +53,25 @@ workers = []
 # Set up a queue for the database connection
 msg_queue = queue.Queue()
 
+# Global PLC client and prcessing lock
+plc_client = None
+plc_lock = threading.Lock()
+
+# Set up threaded operation
+def run_threaded(job_func):
+    job_thread = threading.Thread(target=job_func)
+    job_thread.start()
+
 """
 set up PLC connection
 """
+def init_plc():
+    global plc_client
+    client = snap7.client.Client()
+    client.connect(PLC_IP, PLC_RACK, PLC_SLOT)
+    plc_client = client
+    print("PLC connection established")
+
 def on_connect(client, userdata, flags, rc, properties):
     # print(f"Connected with result code {rc}")
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Connected with result code {rc}")
@@ -95,6 +112,7 @@ setting database
 """
 def db_pool_setting():
     # Set up PostgresSQL connection pool
+    global db_pool
     try:
         db_pool = psycopg2.pool.SimpleConnectionPool(
             1, 20, # Min and max connections
@@ -109,10 +127,13 @@ def db_pool_setting():
     except Exception as e:
         print(f"Cannot create PostgresSQL connection pool: {e}")
 
+    return db_pool
+
 """
 Database write worker thread, retrieves messages from the queue and writes to PostgreSQL.
 """
 def db_worker(worker_id):
+    taipei_tz = pytz.timezone('Asia/Taipei')
     while True:
         msg_playload = msg_queue.get()
         if msg_playload is None:
@@ -124,10 +145,14 @@ def db_worker(worker_id):
             conn = db_pool.getconn()
             cursor = conn.cursor()
             data = json.loads(msg_playload)
-            insert_sql = "INSERT INTO temperature_data (sensor_id, temperature) VALUES (%s, %s)"
-            # cursor.execute(insert_sql, (data["sensor_id"], data["temperature"]))
+
+            time_str = data['timestamp']
+            local_time = datetime.fromisoformat(time_str) # fromisoformat() 函式，它能自動解析 ISO 8601 時間格式
+            utc_time = local_time.astimezone(pytz.utc)
+
+            insert_sql = "INSERT INTO measurements (sensor_id, value, timestamp) VALUES (%s, %s, %s)"            
             for sensor_id in sensor_id_list:
-                cursor.execute(insert_sql, (sensor_id, data[sensor_id]))
+                cursor.execute(insert_sql, (sensor_id, data[sensor_id], utc_time))
             conn.commit()   
             cursor.close()
             db_pool.putconn(conn)
@@ -195,14 +220,13 @@ def main():
     try:
         while True:
             schedule.run_pending()
-            time.sleep(1)
             time.sleep(10)
             print(f"Queue size: {msg_queue.qsize()}")
     except KeyboardInterrupt:
         print("Exiting")        
     except Exception as e:  
         print(f"Error occured: {e}")
-        break
+
     finally:
         client.loop_stop()
         for _ in range(num_workers):
